@@ -6,7 +6,7 @@ Run from the repository root: python -m unittest discover -s tests -v
 import argparse
 import ast
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +17,10 @@ import httpx
 from knowledge_storm import __version__
 from knowledge_storm.interface import Retriever
 from knowledge_storm.rm import ParallelSearch
+from knowledge_storm.storm_wiki.modules.knowledge_curation import TopicExpert
+from knowledge_storm.collaborative_storm.modules.grounded_question_answering import (
+    AnswerQuestionModule,
+)
 
 
 def source(url="https://example.org/source", excerpts=None, title="Source"):
@@ -368,6 +372,54 @@ class ParallelSearchTests(unittest.TestCase):
 
         with MCPFixture().install():
             self.assertEqual(len(asyncio.run(invoke())), 1)
+
+    def test_native_query_producers_filter_blank_lines_before_query_cap(self):
+        for output, expected in [
+            ("- first\n \n- second\n- third", ["first", "second"]),
+            (" \n", []),
+        ]:
+            for producer in ["storm", "costorm"]:
+                with self.subTest(producer=producer, output=output):
+                    rm = ParallelSearch()
+                    retriever = Retriever(rm)
+                    prediction = SimpleNamespace(queries=output)
+                    if producer == "storm":
+                        module = TopicExpert(None, 2, 3, retriever)
+                        module.generate_queries = lambda **kwargs: prediction
+                        module.answer_question = lambda **kwargs: SimpleNamespace(
+                            answer="Useful evidence [1]."
+                        )
+                        invoke = lambda: module.forward("topic", "question", "")
+                    else:
+                        logger = SimpleNamespace(
+                            log_event=lambda name: nullcontext(),
+                            add_query_count=lambda **kwargs: None,
+                        )
+                        module = AnswerQuestionModule(retriever, 2, None, logger)
+                        module.question_to_query = lambda **kwargs: prediction
+                        invoke = lambda: module.retrieve_information(
+                            "topic", "question"
+                        )
+                    fixture = MCPFixture()
+                    with fixture.install():
+                        result = invoke()
+                    queries, information = (
+                        (result.queries, result.searched_results)
+                        if producer == "storm"
+                        else result
+                    )
+                    self.assertEqual(queries, expected)
+                    self.assertEqual(len(information), len(expected))
+                    self.assertEqual(
+                        {
+                            call["params"]["arguments"]["objective"]
+                            for call in fixture.messages("tools/call")
+                        },
+                        set(expected),
+                    )
+                    self.assertEqual(
+                        rm.get_usage_and_reset(), {"ParallelSearch": len(expected)}
+                    )
 
     def test_generic_cli_parsers_and_native_provider_selection(self):
         root = Path(__file__).resolve().parents[1]
